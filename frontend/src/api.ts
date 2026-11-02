@@ -24,7 +24,7 @@ function friendlyError(status: number, detail?: string): string {
   return detail ?? "That request didn't work. Please try rephrasing it.";
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function send(path: string, options?: RequestInit): Promise<Response> {
   let response: Response;
   try {
     response = await fetch(`${API_URL}${path}`, options);
@@ -43,6 +43,11 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     }
     throw new Error(friendlyError(response.status, detail));
   }
+  return response;
+}
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await send(path, options);
   return response.json() as Promise<T>;
 }
 
@@ -97,4 +102,82 @@ export function searchDocuments(
   const params = new URLSearchParams({ query, top_k: String(topK) });
   documentIds.forEach((id) => params.append("document_ids", id));
   return request<SearchResponse>(`${endpoint}?${params}`);
+}
+
+type StreamEvent =
+  | ({ type: "meta" } & Omit<AskResponse, "answer" | "citation_validation">)
+  | { type: "delta"; text: string }
+  | { type: "done"; answer: string; citation_validation: AskResponse["citation_validation"] }
+  | { type: "error"; status: number; detail: string };
+
+const PENDING_VALIDATION: AskResponse["citation_validation"] = {
+  valid: true,
+  citations_found: [],
+  valid_citations: [],
+  invalid_citations: [],
+  has_citations: false,
+  citation_coverage: 0,
+};
+
+/**
+ * Ask a question and receive the answer as it is written.
+ * onUpdate is called with the partial answer after every piece.
+ */
+export async function askQuestionStream(
+  query: string,
+  topK: number,
+  documentIds: string[],
+  onUpdate: (partial: AskResponse) => void,
+): Promise<AskResponse> {
+  const response = await send("/ask/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      query,
+      top_k: topK,
+      document_ids: documentIds.length > 0 ? documentIds : null,
+    }),
+  });
+  if (!response.body) throw new Error(friendlyError(500));
+
+  let current: AskResponse = {
+    query,
+    answer: "",
+    sources: [],
+    retrieved_chunks: 0,
+    context_chunks: 0,
+    citation_validation: PENDING_VALIDATION,
+    streaming: true,
+  };
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line) as StreamEvent;
+      if (event.type === "meta") {
+        const { type: _type, ...meta } = event;
+        current = { ...current, ...meta };
+      } else if (event.type === "delta") {
+        current = { ...current, answer: current.answer + event.text };
+      } else if (event.type === "done") {
+        current = { ...current, answer: event.answer, citation_validation: event.citation_validation, streaming: false };
+      } else {
+        throw new Error(friendlyError(event.status, event.detail));
+      }
+      onUpdate(current);
+    }
+  }
+
+  if (current.streaming) {
+    throw new Error("The answer was interrupted. Please try again.");
+  }
+  return current;
 }

@@ -1,3 +1,4 @@
+import json
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -7,10 +8,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.api.ask import AskRequest
+from app.api.ask import AskRequest, router as ask_router
 from app.api.documents import router as document_router
 from app.core.dependencies import get_db
 from app.rag.chunker import chunk_text, content_fingerprint
+from app.rag.generation import LLMGenerationError, is_summary_request
 from app.rag.retrieval import _unique_by_content
 
 
@@ -97,6 +99,71 @@ class UploadTests(unittest.TestCase):
         db.get.return_value = None
         response = _client(db).delete(f"/documents/{uuid.uuid4()}")
         self.assertEqual(response.status_code, 404)
+
+
+class SummaryTests(unittest.TestCase):
+    def test_summary_requests_are_detected(self):
+        for query in ["Summarize this document", "Give me a summary", "summarise the pdf",
+                      "What is this document about?", "key points please", "TL;DR"]:
+            self.assertTrue(is_summary_request(query), query)
+
+    def test_specific_questions_are_not_summaries(self):
+        for query in ["What is the password policy?", "Which skills does Keshav have?"]:
+            self.assertFalse(is_summary_request(query), query)
+
+    @patch("app.rag.retrieval.func")
+    def test_long_documents_are_sampled_from_start_to_end(self, _func):
+        from app.rag.retrieval import document_chunks
+
+        rows = [(SimpleNamespace(content=str(i)), "doc.pdf") for i in range(40)]
+        db = MagicMock()
+        db.query.return_value.filter.return_value.scalar.return_value = 40
+        db.query.return_value.join.return_value.filter.return_value.order_by.return_value.all.return_value = rows
+
+        sample = document_chunks(db, [uuid.uuid4()], max_chunks=8, spread=True)
+        indexes = [int(item["chunk"].content) for item in sample]
+
+        self.assertEqual(len(indexes), 8)
+        self.assertEqual(indexes[0], 0)
+        self.assertGreaterEqual(indexes[-1], 35)
+        self.assertIsNone(document_chunks(db, [uuid.uuid4()], max_chunks=8))
+
+
+class StreamingTests(unittest.TestCase):
+    def _client(self):
+        app = FastAPI()
+        app.include_router(ask_router)
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+        return TestClient(app)
+
+    def _evidence(self):
+        chunk = SimpleNamespace(content="Passwords need 12 characters.", chunk_index=0,
+                                document_id=uuid.uuid4(), id=uuid.uuid4())
+        return [{"chunk": chunk, "filename": "policy.pdf", "reranker_score": 1.0}]
+
+    def _events(self, response):
+        return [json.loads(line) for line in response.text.splitlines() if line]
+
+    @patch("app.api.ask.stream_answer", return_value=iter(["Passwords need ", "12 characters [S1]."]))
+    @patch("app.api.ask.hybrid_reranked_search")
+    def test_answer_is_streamed_then_validated(self, search, _stream):
+        search.return_value = self._evidence()
+
+        events = self._events(self._client().post("/ask/stream", json={"query": "Password rules?"}))
+
+        self.assertEqual([e["type"] for e in events], ["meta", "delta", "delta", "done"])
+        self.assertEqual(events[0]["documents_used"], ["policy.pdf"])
+        self.assertEqual(events[-1]["answer"], "Passwords need 12 characters [S1].")
+        self.assertTrue(events[-1]["citation_validation"]["valid"])
+
+    @patch("app.api.ask.stream_answer", side_effect=LLMGenerationError(429, "rate limited"))
+    @patch("app.api.ask.hybrid_reranked_search")
+    def test_generation_errors_are_reported_in_the_stream(self, search, _stream):
+        search.return_value = self._evidence()
+
+        events = self._events(self._client().post("/ask/stream", json={"query": "Password rules?"}))
+
+        self.assertEqual(events[-1], {"type": "error", "status": 429, "detail": "rate limited"})
 
 
 if __name__ == "__main__":

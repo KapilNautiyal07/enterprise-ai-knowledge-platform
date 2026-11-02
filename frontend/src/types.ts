@@ -18,6 +18,9 @@ export interface AskResponse {
   sources: Source[];
   retrieved_chunks: number;
   context_chunks: number;
+  documents_used?: string[];
+  // True while the answer is still being written.
+  streaming?: boolean;
   citation_validation: {
     valid: boolean;
     citations_found: string[];

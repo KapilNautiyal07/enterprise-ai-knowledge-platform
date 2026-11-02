@@ -360,6 +360,20 @@ Request body:
 
 `document_ids` is optional and limits the answer to those documents. When the selected documents are small (up to 15 sections), they are read in full instead of retrieving the top passages, which gives complete summaries. The search endpoints accept the same filter as repeated `document_ids` query parameters.
 
+Summary requests ("summarize", "overview", "key points", ...) read the selected documents end to end (sampled evenly for long documents), or the most recent upload when nothing is selected, and use a dedicated summary format: title, overview, sections, key takeaways.
+
+#### POST `/ask/stream`
+
+Same request body as `/ask/`, but streams newline-delimited JSON so answers appear as they are written:
+
+```text
+{"type": "meta", "sources": [...], "documents_used": [...], ...}
+{"type": "delta", "text": "..."}            (repeated)
+{"type": "done", "answer": "...", "citation_validation": {...}}
+```
+
+Errors during generation are sent as `{"type": "error", "status": ..., "detail": ...}`. The web app uses this endpoint.
+
 Response example:
 
 ```json

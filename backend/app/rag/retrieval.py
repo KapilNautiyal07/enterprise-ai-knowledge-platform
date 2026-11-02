@@ -126,11 +126,15 @@ def search_similar_chunks(
 def document_chunks(
     db: Session,
     document_ids: list[UUID],
-    max_chunks: int
+    max_chunks: int,
+    spread: bool = False
 ):
     """
-    Return every chunk of the selected documents in reading order,
-    or None when they are too large to send in full.
+    Return every chunk of the selected documents in reading order.
+
+    When they have more than max_chunks chunks, return None, or with
+    spread=True an evenly spaced sample covering beginning to end
+    (used for summaries of long documents).
     """
 
     total = (
@@ -139,7 +143,7 @@ def document_chunks(
         .scalar()
     )
 
-    if not total or total > max_chunks:
+    if not total or (total > max_chunks and not spread):
         return None
 
     rows = (
@@ -159,10 +163,28 @@ def document_chunks(
         .all()
     )
 
+    if len(rows) > max_chunks:
+        step = len(rows) / max_chunks
+        rows = [rows[int(i * step)] for i in range(max_chunks)]
+
     return [
         {"chunk": chunk, "filename": filename}
         for chunk, filename in rows
     ]
+
+def latest_document_id(db: Session) -> UUID | None:
+    """The most recently uploaded document that has readable text."""
+
+    return (
+        db.query(Document.id)
+        .join(
+            DocumentChunk,
+            DocumentChunk.document_id == Document.id
+        )
+        .order_by(Document.created_at.desc())
+        .limit(1)
+        .scalar()
+    )
 
 def hybrid_search(
     db: Session,

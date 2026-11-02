@@ -1,5 +1,7 @@
 
 import os
+import re
+from collections.abc import Iterator
 
 import openai
 from dotenv import load_dotenv
@@ -53,22 +55,53 @@ Rules:
     question is about all of them; otherwise answer from the document that
     matches the question and name it.
 
-Formatting:
-- Start with a direct one- or two-sentence answer.
-- Then add supporting details as short bullet points, grouped under short
-  bold labels when there are several topics.
+Formatting (Markdown, like a helpful chat assistant):
+- Open with a direct answer in one or two sentences, in plain words.
+- For longer answers, organise details under short "###" headings.
+- Use bullet points for lists of facts; use **bold** for key terms, names,
+  numbers, and deadlines.
+- Use a table only when comparing several items across the same attributes.
 - Put the citation right after the fact it supports, e.g. "... 12 characters [S1]."
-- Use plain Markdown: bold, bullet lists, and simple tables only when comparing items.
-- Keep answers focused; do not repeat the question or add filler.
+- Write for someone who has not read the document: explain jargon briefly.
+- Do not repeat the question, and do not add filler or closing offers.
 """
 
+SUMMARY_INSTRUCTIONS = """
+The user wants a summary. Write it for someone who has not read the document:
 
-def generate_answer(query: str, context: str) -> str:
-    if not context.strip():
-        return (
-            "I couldn't find relevant evidence in the "
-            "available documents to answer this question."
-        )
+1. Start with a "## " heading naming the document (its title, or what it is,
+   e.g. "Résumé of Jane Doe" or "Information Security Policy").
+2. Follow with a short paragraph (2-3 sentences): what the document is,
+   who it is for, and its main purpose.
+3. Then cover the important content under "### " headings that fit the
+   document type (for a résumé: Profile, Experience, Skills, Education;
+   for a policy: Purpose, Key Rules, Responsibilities, Deadlines; for a
+   report: Findings, Recommendations). Under each heading, give 2-5 bullets
+   with concrete facts: names, numbers, dates, requirements.
+4. End with "### Key takeaways": 3-5 bullets with the most important points.
+
+Cite each bullet once, at its end, with the passage label. Cover the whole
+document, not just the beginning, and skip boilerplate such as page numbers
+or repeated headers.
+"""
+
+# Requests that ask for an overview of a document rather than a specific fact.
+SUMMARY_PATTERN = re.compile(
+    r"\b(summar(y|ies|i[sz]e|i[sz]ing)|overview|tl;?dr|gist|"
+    r"key (points|takeaways|highlights)|main (points|ideas)|"
+    r"what('s| is) (this|the) (document|doc|pdf|file|resume|report) about|"
+    r"explain (this|the) (document|doc|pdf|file)|"
+    r"saransh|samjha)",
+    re.IGNORECASE,
+)
+
+
+def is_summary_request(query: str) -> bool:
+
+    return bool(SUMMARY_PATTERN.search(query))
+
+
+def build_messages(query: str, context: str) -> list[dict]:
 
     prompt = (
         f"Question:\n{query}\n\n"
@@ -77,50 +110,98 @@ def generate_answer(query: str, context: str) -> str:
         "Cite supporting passages with their exact source labels."
     )
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            # gpt-oss counts its reasoning tokens here too; 800 cut answers off.
-            max_tokens=2048,
-            reasoning_effort="low",
-        )
-    except openai.RateLimitError as exc:
-        raise LLMGenerationError(
+    if is_summary_request(query):
+        prompt += "\n" + SUMMARY_INSTRUCTIONS
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+
+def normalize_citations(text: str) -> str:
+
+    # gpt-oss models sometimes cite with full-width brackets, e.g. 【S1】.
+    return text.replace("【", "[").replace("】", "]")
+
+
+def _classify(exc: Exception) -> LLMGenerationError:
+    """Translate an SDK error into a safe, user-presentable error."""
+
+    if isinstance(exc, openai.RateLimitError):
+        return LLMGenerationError(
             429,
             "The Groq API rate limit was reached. Try again shortly.",
-        ) from exc
-    except (openai.AuthenticationError, openai.PermissionDeniedError) as exc:
-        raise LLMGenerationError(
+        )
+    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
+        return LLMGenerationError(
             exc.status_code,
             "The Groq API credentials were rejected.",
-        ) from exc
-    except openai.APIStatusError as exc:
+        )
+    if isinstance(exc, openai.APIStatusError):
         if 400 <= exc.status_code < 500:
-            raise LLMGenerationError(
+            return LLMGenerationError(
                 exc.status_code,
                 "The Groq API rejected the request.",
-            ) from exc
-        raise LLMGenerationError(
+            )
+        return LLMGenerationError(
             502,
             "The Groq API could not complete the request.",
-        ) from exc
-    except openai.APIConnectionError as exc:
-        raise LLMGenerationError(
-            502,
-            "The Groq API could not be reached.",
-        ) from exc
+        )
+    return LLMGenerationError(
+        502,
+        "The Groq API could not be reached.",
+    )
+
+
+def _create(query: str, context: str, stream: bool):
+
+    try:
+        return client.chat.completions.create(
+            model=model_name,
+            messages=build_messages(query, context),
+            temperature=0.2,
+            # gpt-oss counts its reasoning tokens here too; 800 cut answers off.
+            max_tokens=3072,
+            reasoning_effort="low",
+            stream=stream,
+        )
+    except openai.APIError as exc:
+        raise _classify(exc) from exc
+
+
+NO_EVIDENCE_ANSWER = (
+    "I couldn't find relevant evidence in the "
+    "available documents to answer this question."
+)
+
+
+def generate_answer(query: str, context: str) -> str:
+    if not context.strip():
+        return NO_EVIDENCE_ANSWER
+
+    response = _create(query, context, stream=False)
 
     answer = response.choices[0].message.content
 
     if not answer or not answer.strip():
         raise RuntimeError("Groq returned an empty response.")
 
-    # gpt-oss models sometimes cite with full-width brackets, e.g. 【S1】.
-    answer = answer.replace("【", "[").replace("】", "]")
+    return normalize_citations(answer).strip()
 
-    return answer.strip()
+
+def stream_answer(query: str, context: str) -> Iterator[str]:
+    """Yield the answer in small pieces as the model writes it."""
+
+    if not context.strip():
+        yield NO_EVIDENCE_ANSWER
+        return
+
+    stream = _create(query, context, stream=True)
+
+    try:
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield normalize_citations(chunk.choices[0].delta.content)
+    except openai.APIError as exc:
+        raise _classify(exc) from exc

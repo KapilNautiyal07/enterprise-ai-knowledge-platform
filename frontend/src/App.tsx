@@ -1,5 +1,7 @@
-import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
-import { askQuestion, deleteDocument, listDocuments, searchDocuments, uploadDocument } from "./api";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { askQuestionStream, deleteDocument, listDocuments, searchDocuments, uploadDocument } from "./api";
 import type { AskResponse, DocumentInfo, SearchMode, SearchResponse, Source } from "./types";
 
 const suggestions = [
@@ -89,7 +91,7 @@ function App() {
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  const busy = turns.some((turn) => turn.status === "loading");
+  const busy = turns.some((turn) => turn.status === "loading" || turn.answer?.streaming);
   const readyDocuments = (documents ?? []).filter((doc) => doc.chunks > 0);
   const nameOf = (id: string) => documents?.find((doc) => doc.document_id === id)?.filename ?? "a removed document";
 
@@ -109,15 +111,16 @@ function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns]);
 
-  // Keep the active conversation in the history list as it changes.
+  // Keep the active conversation in the history list once answers finish.
   useEffect(() => {
+    if (busy) return;
     const finished = turns.filter((turn) => turn.status !== "loading");
     if (finished.length === 0) return;
     setChats((current) => [
       { id: chatId, title: finished[0].question, updatedAt: Date.now(), turns: finished },
       ...current.filter((chat) => chat.id !== chatId),
     ].slice(0, MAX_CHATS));
-  }, [turns, chatId]);
+  }, [turns, chatId, busy]);
 
   async function refreshDocuments() {
     try {
@@ -162,7 +165,10 @@ function App() {
 
     try {
       if (turnKind === "ask") {
-        update({ status: "done", answer: await askQuestion(question, topK, scope) });
+        await askQuestionStream(question, topK, scope, (partial) => {
+          // Show the answer as soon as the first words arrive.
+          if (partial.answer) update({ status: "done", answer: partial });
+        });
       } else {
         update({ status: "done", results: await searchDocuments(question, topK, mode, scope) });
       }
@@ -258,8 +264,8 @@ function App() {
           <HistoryPanel chats={chats} activeId={chatId} busy={busy} onOpen={openChat} onRemove={removeChat} onNew={startNewChat} />
         </aside>
 
-        <section className="flex min-h-[60vh] flex-col">
-          <div className="flex-1 space-y-6 pb-6">
+        <section className="mx-auto flex min-h-[60vh] w-full max-w-3xl flex-col">
+          <div className="flex-1 space-y-10 pb-6">
             {turns.length === 0 ? (
               <Welcome hasDocuments={readyDocuments.length > 0} onPick={(prompt) => { setQuery(prompt); inputRef.current?.focus(); }} />
             ) : (
@@ -477,23 +483,25 @@ function Welcome({ hasDocuments, onPick }: { hasDocuments: boolean; onPick: (pro
 
 function TurnView({ turn, scopeLabel, onRetry }: { turn: Turn; scopeLabel: string; onRetry: () => void }) {
   return (
-    <div className="space-y-3">
-      <div className="flex flex-col items-end gap-1">
-        <div className="max-w-[85%] rounded-2xl rounded-br-md bg-ink px-4 py-3 text-[15px] leading-6 text-white">
+    <div className="space-y-6">
+      <div className="flex justify-end">
+        <div className="max-w-[85%] whitespace-pre-wrap rounded-3xl bg-slate-200/70 px-5 py-3 text-[15px] leading-7 text-ink">
           {turn.question}
         </div>
-        <span className="max-w-[85%] truncate text-xs text-slate-400" title={scopeLabel}>📄 Searched {scopeLabel}</span>
       </div>
-      <div className="card p-5 sm:p-6">
-        {turn.status === "loading" && <Thinking kind={turn.kind} />}
-        {turn.status === "error" && (
-          <div>
-            <p className="text-[15px] leading-7 text-slate-700">😕 {turn.error}</p>
-            <button className="button-secondary mt-4" onClick={onRetry}>Try again</button>
-          </div>
-        )}
-        {turn.answer && <AnswerView turnId={turn.id} result={turn.answer} />}
-        {turn.results && <ResultsView result={turn.results} />}
+      <div className="flex gap-3 sm:gap-4">
+        <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-ink text-sm font-bold text-white">A</div>
+        <div className="min-w-0 flex-1 pt-0.5">
+          {turn.status === "loading" && <Thinking kind={turn.kind} />}
+          {turn.status === "error" && (
+            <div>
+              <p className="text-[15px] leading-7 text-slate-700">😕 {turn.error}</p>
+              <button className="button-secondary mt-3" onClick={onRetry}>Try again</button>
+            </div>
+          )}
+          {turn.answer && <AnswerView turnId={turn.id} result={turn.answer} scopeLabel={scopeLabel} />}
+          {turn.results && <ResultsView result={turn.results} />}
+        </div>
       </div>
     </div>
   );
@@ -508,8 +516,8 @@ function Thinking({ kind }: { kind: Turn["kind"] }) {
   const step = Math.min(Math.floor(seconds / 2), thinkingSteps.length - 1);
 
   return (
-    <div>
-      <div className="flex items-center gap-3 text-sm text-slate-500">
+    <div className="pt-1">
+      <div className="flex items-center gap-3 text-[15px] text-slate-500">
         <span className="flex gap-1">
           {[0, 1, 2].map((dot) => <span key={dot} className="h-2 w-2 animate-bounce rounded-full bg-teal" style={{ animationDelay: `${dot * 150}ms` }} />)}
         </span>
@@ -524,20 +532,26 @@ function Thinking({ kind }: { kind: Turn["kind"] }) {
   );
 }
 
-function AnswerView({ turnId, result }: { turnId: number; result: AskResponse }) {
+function AnswerView({ turnId, result, scopeLabel }: { turnId: number; result: AskResponse; scopeLabel: string }) {
   const [copied, setCopied] = useState(false);
+  const [showSources, setShowSources] = useState(false);
   const validation = result.citation_validation;
+  const streaming = Boolean(result.streaming);
 
   function showSource(label: string) {
-    const element = document.getElementById(`turn-${turnId}-${label}`);
-    if (!element) return;
-    element.scrollIntoView({ behavior: "smooth", block: "center" });
-    element.classList.add("source-flash");
-    setTimeout(() => element.classList.remove("source-flash"), 1600);
+    setShowSources(true);
+    // Wait for the sources list to render before scrolling to it.
+    setTimeout(() => {
+      const element = document.getElementById(`turn-${turnId}-${label}`);
+      if (!element) return;
+      element.scrollIntoView({ behavior: "smooth", block: "center" });
+      element.classList.add("source-flash");
+      setTimeout(() => element.classList.remove("source-flash"), 1600);
+    }, 50);
   }
 
   async function copy() {
-    await navigator.clipboard.writeText(result.answer);
+    await navigator.clipboard.writeText(result.answer.replace(/\s?\[S\d+(?:\s*,\s*S\d+)*\]/g, ""));
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   }
@@ -546,38 +560,44 @@ function AnswerView({ turnId, result }: { turnId: number; result: AskResponse })
   const sources = [...result.sources].sort(
     (a, b) => Number(cited.has(b.source_id ?? "")) - Number(cited.has(a.source_id ?? "")),
   );
+  const basedOn = result.documents_used?.length ? result.documents_used.join(", ") : scopeLabel;
 
   return (
     <div>
-      <div className="space-y-3 text-[15px] leading-7 text-slate-700">
-        <FormattedAnswer text={result.answer} onCite={showSource} />
+      <div className="markdown">
+        <Markdown text={result.answer} onCite={showSource} />
+        {streaming && <span className="streaming-cursor" aria-hidden />}
       </div>
 
-      <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-        <TrustNote validation={validation} hasSources={result.sources.length > 0} />
-        <button className="text-xs font-medium text-slate-500 hover:text-teal" onClick={copy}>
-          {copied ? "✓ Copied" : "Copy answer"}
-        </button>
-      </div>
-
-      {sources.length > 0 && (
-        <details className="group mt-5 border-t border-slate-100 pt-4" open={cited.size > 0}>
-          <summary className="cursor-pointer list-none text-sm font-semibold text-slate-700">
-            <span className="mr-1 inline-block transition group-open:rotate-90">›</span>
-            Where this came from ({cited.size > 0 ? `${cited.size} cited` : `${sources.length} passages checked`})
-          </summary>
-          <div className="mt-3 grid gap-3">
-            {sources.map((source) => (
-              <SourceCard
-                key={source.chunk_id}
-                id={`turn-${turnId}-${source.source_id}`}
-                source={source}
-                label={source.source_id ?? ""}
-                muted={cited.size > 0 && !cited.has(source.source_id ?? "")}
-              />
-            ))}
+      {!streaming && (
+        <>
+          <div className="mt-4 flex flex-wrap items-center gap-1.5 text-xs text-slate-500">
+            <button className="action-button" onClick={copy}>{copied ? "✓ Copied" : "⧉ Copy"}</button>
+            {sources.length > 0 && (
+              <button className="action-button" onClick={() => setShowSources(!showSources)}>
+                📄 {showSources ? "Hide sources" : `Sources (${cited.size || sources.length})`}
+              </button>
+            )}
+            <TrustNote validation={validation} hasSources={sources.length > 0} />
           </div>
-        </details>
+          {sources.length > 0 && (
+            <p className="mt-2 truncate text-xs text-slate-400" title={basedOn}>Based on: {basedOn}</p>
+          )}
+
+          {showSources && (
+            <div className="mt-4 grid gap-3">
+              {sources.map((source) => (
+                <SourceCard
+                  key={source.chunk_id}
+                  id={`turn-${turnId}-${source.source_id}`}
+                  source={source}
+                  label={source.source_id ?? ""}
+                  muted={cited.size > 0 && !cited.has(source.source_id ?? "")}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -585,108 +605,47 @@ function AnswerView({ turnId, result }: { turnId: number; result: AskResponse })
 
 function TrustNote({ validation, hasSources }: { validation: AskResponse["citation_validation"]; hasSources: boolean }) {
   if (!hasSources) {
-    return <span className="trust trust-neutral">I didn't find anything about this in your documents.</span>;
+    return <span className="px-2 text-slate-400">Nothing about this in your documents</span>;
   }
   if (!validation.has_citations) {
-    return <span className="trust trust-neutral">No references in this answer. Your documents may not cover this.</span>;
+    return <span className="px-2 text-slate-400">No references in this answer</span>;
   }
   if (!validation.valid) {
-    return <span className="trust trust-warn">⚠ Some references don't match a source. Please double-check this answer.</span>;
+    return <span className="px-2 text-amber-600">⚠ Some references don't match a source; please double-check</span>;
   }
-  return <span className="trust trust-good">✓ Backed by your documents. Click a number to see the exact passage.</span>;
+  return <span className="px-2 text-teal">✓ Backed by your documents</span>;
 }
 
-function FormattedAnswer({ text, onCite }: { text: string; onCite: (label: string) => void }) {
-  const blocks: ReactNode[] = [];
-  let bullets: string[] = [];
-  let tableRows: string[][] = [];
-
-  const flushBullets = () => {
-    if (bullets.length === 0) return;
-    blocks.push(
-      <ul key={`list-${blocks.length}`} className="list-disc space-y-1 pl-5">
-        {bullets.map((item, index) => <li key={index}><Inline text={item} onCite={onCite} /></li>)}
-      </ul>,
-    );
-    bullets = [];
-  };
-
-  const flushTable = () => {
-    if (tableRows.length === 0) return;
-    const [header, ...body] = tableRows;
-    blocks.push(
-      <div key={`table-${blocks.length}`} className="overflow-x-auto rounded-xl border border-slate-200">
-        <table className="w-full text-left text-sm">
-          <thead className="bg-mist text-slate-700">
-            <tr>{header.map((cell, index) => <th key={index} className="px-3 py-2 font-semibold"><Inline text={cell} onCite={onCite} /></th>)}</tr>
-          </thead>
-          <tbody>
-            {body.map((row, rowIndex) => (
-              <tr key={rowIndex} className="border-t border-slate-100">
-                {row.map((cell, index) => <td key={index} className="px-3 py-2 align-top"><Inline text={cell} onCite={onCite} /></td>)}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>,
-    );
-    tableRows = [];
-  };
-
-  for (const rawLine of text.split("\n")) {
-    const line = rawLine.trim();
-    if (line.startsWith("|") && line.endsWith("|")) {
-      flushBullets();
-      // Skip the |---|---| separator row.
-      if (!/^\|[\s:|-]+\|$/.test(line)) {
-        tableRows.push(line.slice(1, -1).split("|").map((cell) => cell.trim()));
-      }
-      continue;
-    }
-    flushTable();
-    const bullet = line.match(/^(?:[-*•]|\d+\.)\s+(.*)$/);
-    if (bullet) {
-      bullets.push(bullet[1]);
-      continue;
-    }
-    flushBullets();
-    if (!line) continue;
-    const heading = line.match(/^#{1,6}\s+(.*)$/);
-    blocks.push(
-      heading
-        ? <p key={blocks.length} className="font-semibold text-ink"><Inline text={heading[1]} onCite={onCite} /></p>
-        : <p key={blocks.length}><Inline text={line} onCite={onCite} /></p>,
-    );
-  }
-  flushBullets();
-  flushTable();
-
-  return <>{blocks}</>;
+// Turn [S1] / [S1, S2] into links that the renderer shows as citation chips.
+function linkCitations(text: string) {
+  return text.replace(/\[(S\d+(?:\s*,\s*S\d+)*)\]/g, (_match, labels: string) =>
+    labels
+      .split(/\s*,\s*/)
+      .map((label) => `[${label.slice(1)}](#cite-${label})`)
+      .join(""),
+  );
 }
 
-function Inline({ text, onCite }: { text: string; onCite: (label: string) => void }) {
-  const parts = text.split(/(\*\*[^*]+\*\*|\[S\d+(?:\s*,\s*S\d+)*\])/g);
+function Markdown({ text, onCite }: { text: string; onCite: (label: string) => void }) {
   return (
-    <>
-      {parts.map((part, index) => {
-        if (part.startsWith("**") && part.endsWith("**")) {
-          return <strong key={index} className="font-semibold text-ink">{part.slice(2, -2)}</strong>;
-        }
-        const citation = part.match(/^\[(S\d+(?:\s*,\s*S\d+)*)\]$/);
-        if (citation) {
-          return (
-            <Fragment key={index}>
-              {citation[1].split(/\s*,\s*/).map((label) => (
-                <button key={label} className="cite" title="Show where this came from" onClick={() => onCite(label)}>
-                  {label.slice(1)}
-                </button>
-              ))}
-            </Fragment>
-          );
-        }
-        return <Fragment key={index}>{part}</Fragment>;
-      })}
-    </>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ href, children }) =>
+          href?.startsWith("#cite-") ? (
+            <button className="cite" title="Show where this came from" onClick={() => onCite(href.slice("#cite-".length))}>
+              {children}
+            </button>
+          ) : (
+            <a href={href} target="_blank" rel="noreferrer">{children}</a>
+          ),
+        table: ({ children }) => (
+          <div className="table-wrap"><table>{children}</table></div>
+        ),
+      }}
+    >
+      {linkCitations(text)}
+    </ReactMarkdown>
   );
 }
 
@@ -752,25 +711,24 @@ type ComposerProps = {
 function Composer({ inputRef, query, setQuery, kind, setKind, mode, setMode, topK, setTopK, busy, scopeLabel, onSubmit }: ComposerProps) {
   const tooShort = query.trim().length < 3;
 
+  // Grow the input with its content, up to a limit.
+  useEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
+  }, [query, inputRef]);
+
   return (
-    <div className="sticky bottom-0 -mx-1 bg-gradient-to-t from-mist via-mist to-mist/0 px-1 pb-4 pt-4">
-      <div className="card p-2">
-        <div className="flex flex-wrap items-center justify-between gap-2 px-2 pt-1">
-          <div className="flex gap-1">
-            <ModeTab active={kind === "ask"} onClick={() => setKind("ask")}>💬 Get an answer</ModeTab>
-            <ModeTab active={kind === "find"} onClick={() => setKind("find")}>🔍 Just find passages</ModeTab>
-          </div>
-          <span className="max-w-full truncate text-xs text-slate-400 sm:max-w-[50%]" title={scopeLabel}>
-            Asking about: <span className="font-medium text-slate-600">{scopeLabel}</span>
-          </span>
-        </div>
+    <div className="sticky bottom-0 -mx-1 bg-gradient-to-t from-mist via-mist to-mist/0 px-1 pb-3 pt-6">
+      <div className="rounded-[28px] border border-slate-200 bg-white px-3 pb-2 pt-2 shadow-card focus-within:border-slate-300">
         <textarea
           ref={inputRef}
-          rows={2}
-          className="w-full resize-none bg-transparent px-4 py-3 text-[15px] outline-none placeholder:text-slate-400"
+          rows={1}
+          className="max-h-[200px] w-full resize-none bg-transparent px-3 py-2.5 text-[15px] leading-6 outline-none placeholder:text-slate-400"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
-          placeholder={kind === "ask" ? "Ask a question, e.g. “How many vacation days do employees get?”" : "Type words or a topic to find in your documents…"}
+          placeholder={kind === "ask" ? "Ask anything about your documents…" : "Type words or a topic to find in your documents…"}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
@@ -778,37 +736,48 @@ function Composer({ inputRef, query, setQuery, kind, setKind, mode, setMode, top
             }
           }}
         />
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-3 pt-2">
-          <details className="relative text-xs text-slate-500">
-            <summary className="cursor-pointer list-none py-1.5 hover:text-teal">⚙ Options</summary>
-            <div className="absolute bottom-9 left-0 z-10 w-72 space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
-              <label className="block">
-                <span className="font-semibold text-slate-700">How should I look for matches?</span>
-                <select className="select-control mt-1.5 w-full" value={mode} onChange={(event) => setMode(event.target.value as SearchMode)}>
-                  {matchOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                </select>
-                <span className="mt-1 block leading-5">{matchOptions.find((option) => option.value === mode)?.hint}</span>
-                {kind === "ask" && <span className="mt-1 block leading-5 text-slate-400">Answers always use “Best match”.</span>}
-              </label>
-              <label className="block">
-                <span className="font-semibold text-slate-700">How many passages should I read?</span>
-                <select className="select-control mt-1.5 w-full" value={topK} onChange={(event) => setTopK(Number(event.target.value))}>
-                  <option value={3}>A few (3), faster</option>
-                  <option value={5}>Some (5), recommended</option>
-                  <option value={8}>More (8)</option>
-                  <option value={10}>Lots (10), most thorough</option>
-                </select>
-              </label>
-            </div>
-          </details>
-          <div className="flex items-center gap-3">
-            <span className="hidden text-xs text-slate-400 sm:inline">Enter to send · Shift+Enter for a new line</span>
-            <button className="button-primary" disabled={busy || tooShort} onClick={onSubmit}>
-              {busy ? "Working…" : kind === "ask" ? "Ask →" : "Find →"}
-            </button>
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-1">
+            <ModeTab active={kind === "ask"} onClick={() => setKind("ask")}>💬 Answer</ModeTab>
+            <ModeTab active={kind === "find"} onClick={() => setKind("find")}>🔍 Find passages</ModeTab>
+            <details className="relative text-xs text-slate-500">
+              <summary className="cursor-pointer list-none rounded-full px-3 py-1.5 font-semibold hover:bg-mist hover:text-slate-700">⚙ Options</summary>
+              <div className="absolute bottom-10 left-0 z-10 w-72 space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-card">
+                <label className="block">
+                  <span className="font-semibold text-slate-700">How should I look for matches?</span>
+                  <select className="select-control mt-1.5 w-full" value={mode} onChange={(event) => setMode(event.target.value as SearchMode)}>
+                    {matchOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                  </select>
+                  <span className="mt-1 block leading-5">{matchOptions.find((option) => option.value === mode)?.hint}</span>
+                  {kind === "ask" && <span className="mt-1 block leading-5 text-slate-400">Answers always use “Best match”.</span>}
+                </label>
+                <label className="block">
+                  <span className="font-semibold text-slate-700">How many passages should I read?</span>
+                  <select className="select-control mt-1.5 w-full" value={topK} onChange={(event) => setTopK(Number(event.target.value))}>
+                    <option value={3}>A few (3), faster</option>
+                    <option value={5}>Some (5), recommended</option>
+                    <option value={8}>More (8)</option>
+                    <option value={10}>Lots (10), most thorough</option>
+                  </select>
+                  <span className="mt-1 block leading-5 text-slate-400">Summaries and small documents are always read in full.</span>
+                </label>
+              </div>
+            </details>
           </div>
+          <button
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-ink text-lg text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+            disabled={busy || tooShort}
+            onClick={onSubmit}
+            title={kind === "ask" ? "Send" : "Find"}
+            aria-label="Send"
+          >
+            {busy ? <span className="h-3 w-3 rounded-sm bg-white" /> : "↑"}
+          </button>
         </div>
       </div>
+      <p className="mt-2 truncate px-4 text-center text-xs text-slate-400" title={scopeLabel}>
+        Asking about <span className="font-medium text-slate-500">{scopeLabel}</span> · Answers come only from your documents. Check important details.
+      </p>
     </div>
   );
 }
@@ -816,7 +785,7 @@ function Composer({ inputRef, query, setQuery, kind, setKind, mode, setMode, top
 function ModeTab({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
   return (
     <button
-      className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${active ? "bg-teal/10 text-teal" : "text-slate-500 hover:text-slate-700"}`}
+      className={`rounded-full px-3 py-1.5 text-xs font-semibold transition ${active ? "bg-teal/10 text-teal" : "text-slate-500 hover:bg-mist hover:text-slate-700"}`}
       onClick={onClick}
     >
       {children}
