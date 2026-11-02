@@ -1,0 +1,21 @@
+
+[
+  {
+    "id": "E001",
+    "query": "What are the main rules described in the uploaded document?",
+    "expected_keywords": [],
+    "should_abstain": false
+  },
+  {
+    "id": "E002",
+    "query": "Summarize the main points of the uploaded document",
+    "expected_keywords": [],
+    "should_abstain": false
+  },
+  {
+    "id": "E003",
+    "query": "What is the official policy for interplanetary travel?",
+    "expected_keywords": [],
+    "should_abstain": true
+  }
+]

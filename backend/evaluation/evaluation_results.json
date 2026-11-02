@@ -1,0 +1,29 @@
+[
+  {
+    "id": "E001",
+    "query": "What are the main rules described in the uploaded document?",
+    "keyword_pass": null,
+    "abstention_pass": true,
+    "citation_pass": true,
+    "retrieved_chunks": 5,
+    "answer": "Based on the provided documents, the main rules are organized across several company policies:\n\n### 1. Employee Remote Work Policy (N"
+  },
+  {
+    "id": "E002",
+    "query": "Summarize the main points of the uploaded document",
+    "keyword_pass": null,
+    "abstention_pass": true,
+    "citation_pass": true,
+    "retrieved_chunks": 5,
+    "answer": "The uploaded document, titled **\"Fictional Company Policy Test Pack\"** for NovaTech Solutions Pvt. Ltd., is a test dataset designed"
+  },
+  {
+    "id": "E003",
+    "query": "What is the official policy for interplanetary travel?",
+    "keyword_pass": null,
+    "abstention_pass": false,
+    "citation_pass": true,
+    "retrieved_chunks": 5,
+    "answer": "The provided documents do not mention or document an official policy for interplanetary travel."
+  }
+]
