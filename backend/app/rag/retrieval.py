@@ -1,19 +1,54 @@
-from sqlalchemy.orm import Session
+from uuid import UUID
 
-from app.models.document import DocumentChunk, Document
-from app.rag.embeddings import generate_embedding
 from sqlalchemy import func
+from sqlalchemy.orm import Session
 
 from app.models.document import DocumentChunk, Document
 from app.rag.embeddings import generate_embedding
-from sqlalchemy.orm import Session
-
 from app.rag.reranker import rerank_chunks
+
+
+def _restrict(query, document_ids: list[UUID] | None):
+    """Limit a chunk query to the selected documents, if any were given."""
+
+    if document_ids:
+        query = query.filter(
+            DocumentChunk.document_id.in_(document_ids)
+        )
+
+    return query
+
+
+def _unique_by_content(results, top_k: int):
+    """
+    Drop chunks whose text is identical to a higher-ranked chunk
+    (e.g. the same file uploaded twice).
+    """
+
+    seen = set()
+    unique = []
+
+    for result in results:
+
+        content = result[0].content
+
+        if content in seen:
+            continue
+
+        seen.add(content)
+        unique.append(result)
+
+        if len(unique) == top_k:
+            break
+
+    return unique
+
 
 def keyword_search(
     db: Session,
     query: str,
-    top_k: int = 5
+    top_k: int = 5,
+    document_ids: list[UUID] | None = None
 ):
 
     ts_query = func.plainto_tsquery(
@@ -27,14 +62,17 @@ def keyword_search(
     )
 
     results = (
-        db.query(
-            DocumentChunk,
-            Document.filename,
-            rank.label("rank")
-        )
-        .join(
-            Document,
-            Document.id == DocumentChunk.document_id
+        _restrict(
+            db.query(
+                DocumentChunk,
+                Document.filename,
+                rank.label("rank")
+            )
+            .join(
+                Document,
+                Document.id == DocumentChunk.document_id
+            ),
+            document_ids
         )
         .filter(
             DocumentChunk.search_vector.op("@@")(
@@ -44,16 +82,17 @@ def keyword_search(
         .order_by(
             rank.desc()
         )
-        .limit(top_k)
+        .limit(top_k * 2)
         .all()
     )
 
-    return results
+    return _unique_by_content(results, top_k)
 
 def search_similar_chunks(
     db: Session,
     query: str,
-    top_k: int = 5
+    top_k: int = 5,
+    document_ids: list[UUID] | None = None
 ):
     # Generate embedding for the user's question
     query_embedding = generate_embedding(query)
@@ -65,27 +104,72 @@ def search_similar_chunks(
     )
 
     results = (
+        _restrict(
+            db.query(
+                DocumentChunk,
+                Document.filename,
+                distance.label("distance")
+            )
+            .join(
+                Document,
+                Document.id == DocumentChunk.document_id
+            ),
+            document_ids
+        )
+        .order_by(distance)
+        .limit(top_k * 2)
+        .all()
+    )
+
+    return _unique_by_content(results, top_k)
+
+def document_chunks(
+    db: Session,
+    document_ids: list[UUID],
+    max_chunks: int
+):
+    """
+    Return every chunk of the selected documents in reading order,
+    or None when they are too large to send in full.
+    """
+
+    total = (
+        db.query(func.count(DocumentChunk.id))
+        .filter(DocumentChunk.document_id.in_(document_ids))
+        .scalar()
+    )
+
+    if not total or total > max_chunks:
+        return None
+
+    rows = (
         db.query(
             DocumentChunk,
-            Document.filename,
-            distance.label("distance")
+            Document.filename
         )
         .join(
             Document,
             Document.id == DocumentChunk.document_id
         )
-        .order_by(distance)
-        .limit(top_k)
+        .filter(DocumentChunk.document_id.in_(document_ids))
+        .order_by(
+            Document.created_at,
+            DocumentChunk.chunk_index
+        )
         .all()
     )
 
-    return results
+    return [
+        {"chunk": chunk, "filename": filename}
+        for chunk, filename in rows
+    ]
 
 def hybrid_search(
     db: Session,
     query: str,
     top_k: int = 5,
-    candidate_k: int = 10
+    candidate_k: int = 10,
+    document_ids: list[UUID] | None = None
 ):
     """
     Combine vector search and keyword search
@@ -95,13 +179,15 @@ def hybrid_search(
     vector_results = search_similar_chunks(
         db=db,
         query=query,
-        top_k=candidate_k
+        top_k=candidate_k,
+        document_ids=document_ids
     )
 
     keyword_results = keyword_search(
         db=db,
         query=query,
-        top_k=candidate_k
+        top_k=candidate_k,
+        document_ids=document_ids
     )
 
     # RRF constant
@@ -120,11 +206,12 @@ def hybrid_search(
 
         chunk, filename, distance = result
 
-        chunk_id = str(chunk.id)
+        # Key by content so identical chunks from duplicate uploads merge.
+        key = chunk.content
 
-        if chunk_id not in fused_results:
+        if key not in fused_results:
 
-            fused_results[chunk_id] = {
+            fused_results[key] = {
                 "chunk": chunk,
                 "filename": filename,
                 "vector_rank": None,
@@ -132,11 +219,13 @@ def hybrid_search(
                 "rrf_score": 0.0
             }
 
-        fused_results[chunk_id]["vector_rank"] = rank
+        if fused_results[key]["vector_rank"] is None:
 
-        fused_results[chunk_id]["rrf_score"] += (
-            1 / (rrf_k + rank)
-        )
+            fused_results[key]["vector_rank"] = rank
+
+            fused_results[key]["rrf_score"] += (
+                1 / (rrf_k + rank)
+            )
 
     # -------------------------
     # Keyword results
@@ -149,11 +238,11 @@ def hybrid_search(
 
         chunk, filename, keyword_score = result
 
-        chunk_id = str(chunk.id)
+        key = chunk.content
 
-        if chunk_id not in fused_results:
+        if key not in fused_results:
 
-            fused_results[chunk_id] = {
+            fused_results[key] = {
                 "chunk": chunk,
                 "filename": filename,
                 "vector_rank": None,
@@ -161,11 +250,13 @@ def hybrid_search(
                 "rrf_score": 0.0
             }
 
-        fused_results[chunk_id]["keyword_rank"] = rank
+        if fused_results[key]["keyword_rank"] is None:
 
-        fused_results[chunk_id]["rrf_score"] += (
-            1 / (rrf_k + rank)
-        )
+            fused_results[key]["keyword_rank"] = rank
+
+            fused_results[key]["rrf_score"] += (
+                1 / (rrf_k + rank)
+            )
 
     # -------------------------
     # Sort by RRF score
@@ -183,7 +274,8 @@ def hybrid_reranked_search(
     db: Session,
     query: str,
     top_k: int = 5,
-    candidate_k: int = 20
+    candidate_k: int = 20,
+    document_ids: list[UUID] | None = None
 ):
     """
     Hybrid retrieval followed by cross-encoder reranking.
@@ -192,7 +284,8 @@ def hybrid_reranked_search(
     hybrid_results = hybrid_search(
         db=db,
         query=query,
-        top_k=candidate_k
+        top_k=candidate_k,
+        document_ids=document_ids
     )
 
     reranked_results = rerank_chunks(

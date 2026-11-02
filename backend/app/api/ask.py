@@ -1,12 +1,13 @@
 
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_db
-from app.rag.retrieval import hybrid_reranked_search
+from app.rag.retrieval import document_chunks, hybrid_reranked_search
 from app.rag.context_builder import build_context
 from app.rag.generation import LLMGenerationError, generate_answer
 from app.rag.citation_validator import validate_citations
@@ -20,6 +21,12 @@ router = APIRouter(
 class AskRequest(BaseModel):
     query: str = Field(min_length=3, max_length=2000)
     top_k: int = Field(default=5, ge=1, le=10)
+    # Restrict answers to these documents; all documents when omitted.
+    document_ids: list[UUID] | None = Field(default=None, max_length=50)
+
+
+# Selected documents up to this size are read in full (better summaries).
+FULL_DOCUMENT_CHUNKS = 15
 
 
 @router.post("/")
@@ -28,13 +35,25 @@ def ask_question(
     db: Session = Depends(get_db)
 ):
     try:
-        # 1. Retrieve and rerank relevant chunks.
-        results = hybrid_reranked_search(
-            db=db,
-            query=request.query,
-            top_k=request.top_k,
-            candidate_k=20
-        )
+        # 1. Read small selected documents in full; otherwise retrieve
+        #    and rerank the most relevant chunks.
+        results = None
+
+        if request.document_ids:
+            results = document_chunks(
+                db=db,
+                document_ids=request.document_ids,
+                max_chunks=FULL_DOCUMENT_CHUNKS
+            )
+
+        if results is None:
+            results = hybrid_reranked_search(
+                db=db,
+                query=request.query,
+                top_k=request.top_k,
+                candidate_k=20,
+                document_ids=request.document_ids
+            )
 
         # 2. Assemble evidence and source metadata.
         assembled = build_context(results)

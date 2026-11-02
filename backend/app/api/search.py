@@ -1,27 +1,15 @@
-from fastapi import APIRouter, Depends
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_db
-from app.rag.retrieval import search_similar_chunks
-
-from app.rag.retrieval import (
-    search_similar_chunks,
-    keyword_search
-)
-
-from app.rag.retrieval import (
-    search_similar_chunks,
-    keyword_search,
-    hybrid_search
-)
-
 from app.rag.retrieval import (
     search_similar_chunks,
     keyword_search,
     hybrid_search,
     hybrid_reranked_search
 )
-
 
 
 router = APIRouter(
@@ -34,13 +22,15 @@ router = APIRouter(
 def search_documents(
     query: str,
     top_k: int = 5,
+    document_ids: list[UUID] | None = Query(None),
     db: Session = Depends(get_db)
 ):
 
     results = search_similar_chunks(
         db=db,
         query=query,
-        top_k=top_k
+        top_k=top_k,
+        document_ids=document_ids
     )
 
     return {
@@ -66,13 +56,15 @@ def search_documents(
 def keyword_search_documents(
     query: str,
     top_k: int = 5,
+    document_ids: list[UUID] | None = Query(None),
     db: Session = Depends(get_db)
 ):
 
     results = keyword_search(
         db=db,
         query=query,
-        top_k=top_k
+        top_k=top_k,
+        document_ids=document_ids
     )
 
     return {
@@ -94,21 +86,23 @@ def keyword_search_documents(
 def hybrid_search_documents(
     query: str,
     top_k: int = 5,
+    document_ids: list[UUID] | None = Query(None),
     db: Session = Depends(get_db)
 ):
 
     results = hybrid_search(
         db=db,
         query=query,
-        top_k=top_k
+        top_k=top_k,
+        document_ids=document_ids
     )
 
     return {
         "query": query,
         "results": [
             {
-                "chunk_id": item["chunk"].id,
-                "document_id": item["chunk"].document_id,
+                "chunk_id": str(item["chunk"].id),
+                "document_id": str(item["chunk"].document_id),
                 "filename": item["filename"],
                 "chunk_index": item["chunk"].chunk_index,
                 "vector_rank": item["vector_rank"],
@@ -127,13 +121,15 @@ def hybrid_search_documents(
 def reranked_search_documents(
     query: str,
     top_k: int = 5,
+    document_ids: list[UUID] | None = Query(None),
     db: Session = Depends(get_db)
 ):
 
     results = hybrid_reranked_search(
         db=db,
         query=query,
-        top_k=top_k
+        top_k=top_k,
+        document_ids=document_ids
     )
 
     return {

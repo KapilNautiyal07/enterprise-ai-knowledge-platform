@@ -1,11 +1,11 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
-import { askQuestion, searchDocuments, uploadDocument } from "./api";
-import type { AskResponse, SearchMode, SearchResponse, Source } from "./types";
+import { askQuestion, deleteDocument, listDocuments, searchDocuments, uploadDocument } from "./api";
+import type { AskResponse, DocumentInfo, SearchMode, SearchResponse, Source } from "./types";
 
 const suggestions = [
-  { title: "Get the big picture", prompt: "Summarize the main points of the uploaded document" },
-  { title: "Find the rules", prompt: "What are the main rules described in the uploaded document?" },
-  { title: "Check a specific policy", prompt: "What is the password policy?" },
+  { title: "Get the big picture", prompt: "Summarize this document" },
+  { title: "Pull out key facts", prompt: "What are the most important points I should know?" },
+  { title: "Check a specific detail", prompt: "What is the password policy?" },
 ];
 
 const thinkingSteps = [
@@ -22,48 +22,139 @@ const matchOptions: { value: SearchMode; label: string; hint: string }[] = [
 ];
 
 const allowedExtensions = [".pdf", ".docx", ".txt"];
+const CHATS_KEY = "atlas.chats";
+const SELECTION_KEY = "atlas.selectedDocuments";
+const MAX_CHATS = 20;
 
 type Turn = {
   id: number;
   question: string;
   kind: "ask" | "find";
   status: "loading" | "done" | "error";
+  scope: string[];
   answer?: AskResponse;
   results?: SearchResponse;
   error?: string;
 };
 
-type UploadedFile = {
+type Chat = {
+  id: string;
+  title: string;
+  updatedAt: number;
+  turns: Turn[];
+};
+
+type Upload = {
   name: string;
-  status: "uploading" | "ready" | "failed";
-  sections?: number;
+  status: "uploading" | "failed";
   message?: string;
 };
+
+function loadJson<T>(key: string, fallback: T): T {
+  try {
+    const value = localStorage.getItem(key);
+    return value ? (JSON.parse(value) as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveChats(chats: Chat[]) {
+  // Drop the oldest chats if the browser's storage quota is exceeded.
+  for (let count = chats.length; count >= 0; count--) {
+    try {
+      localStorage.setItem(CHATS_KEY, JSON.stringify(chats.slice(0, count)));
+      return;
+    } catch {
+      // Try again with fewer chats.
+    }
+  }
+}
+
+const newChatId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 function App() {
   const [query, setQuery] = useState("");
   const [kind, setKind] = useState<Turn["kind"]>("ask");
   const [mode, setMode] = useState<SearchMode>("reranked");
   const [topK, setTopK] = useState(5);
+  const [chats, setChats] = useState<Chat[]>(() => loadJson<Chat[]>(CHATS_KEY, []));
+  const [chatId, setChatId] = useState(newChatId);
   const [turns, setTurns] = useState<Turn[]>([]);
-  const [files, setFiles] = useState<UploadedFile[]>([]);
-  const nextId = useRef(1);
+  const [documents, setDocuments] = useState<DocumentInfo[] | null>(null);
+  const [documentsError, setDocumentsError] = useState("");
+  const [selected, setSelected] = useState<string[]>(() => loadJson<string[]>(SELECTION_KEY, []));
+  const [uploads, setUploads] = useState<Upload[]>([]);
+  const [notice, setNotice] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const busy = turns.some((turn) => turn.status === "loading");
+  const readyDocuments = (documents ?? []).filter((doc) => doc.chunks > 0);
+  const nameOf = (id: string) => documents?.find((doc) => doc.document_id === id)?.filename ?? "a removed document";
+
+  useEffect(() => {
+    refreshDocuments();
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem(SELECTION_KEY, JSON.stringify(selected));
+  }, [selected]);
+
+  useEffect(() => {
+    saveChats(chats);
+  }, [chats]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [turns]);
 
+  // Keep the active conversation in the history list as it changes.
+  useEffect(() => {
+    const finished = turns.filter((turn) => turn.status !== "loading");
+    if (finished.length === 0) return;
+    setChats((current) => [
+      { id: chatId, title: finished[0].question, updatedAt: Date.now(), turns: finished },
+      ...current.filter((chat) => chat.id !== chatId),
+    ].slice(0, MAX_CHATS));
+  }, [turns, chatId]);
+
+  async function refreshDocuments() {
+    try {
+      const list = await listDocuments();
+      setDocuments(list);
+      setDocumentsError("");
+      // Forget selections for documents that no longer exist.
+      setSelected((current) => current.filter((id) => list.some((doc) => doc.document_id === id && doc.chunks > 0)));
+    } catch (requestError) {
+      setDocumentsError(requestError instanceof Error ? requestError.message : "Couldn't load your documents.");
+    }
+  }
+
+  function startNewChat() {
+    setChatId(newChatId());
+    setTurns([]);
+    inputRef.current?.focus();
+  }
+
+  function openChat(chat: Chat) {
+    setChatId(chat.id);
+    setTurns(chat.turns);
+  }
+
+  function removeChat(id: string) {
+    setChats((current) => current.filter((chat) => chat.id !== id));
+    if (id === chatId) startNewChat();
+  }
+
   async function submit(text = query) {
     const question = text.trim();
     if (question.length < 3 || busy) return;
 
-    const id = nextId.current++;
+    const id = Date.now();
     const turnKind = kind;
-    setTurns((current) => [...current, { id, question, kind: turnKind, status: "loading" }]);
+    const scope = [...selected];
+    setTurns((current) => [...current, { id, question, kind: turnKind, status: "loading", scope }]);
     setQuery("");
 
     const update = (patch: Partial<Turn>) =>
@@ -71,9 +162,9 @@ function App() {
 
     try {
       if (turnKind === "ask") {
-        update({ status: "done", answer: await askQuestion(question, topK) });
+        update({ status: "done", answer: await askQuestion(question, topK, scope) });
       } else {
-        update({ status: "done", results: await searchDocuments(question, topK, mode) });
+        update({ status: "done", results: await searchDocuments(question, topK, mode, scope) });
       }
     } catch (requestError) {
       update({
@@ -87,28 +178,49 @@ function App() {
     if (!file) return;
     const name = file.name;
     const extension = name.slice(name.lastIndexOf(".")).toLowerCase();
+    const setUpload = (upload: Upload | null) =>
+      setUploads((current) => [...(upload ? [upload] : []), ...current.filter((item) => item.name !== name)]);
 
     if (!allowedExtensions.includes(extension)) {
-      setFiles((current) => [
-        { name, status: "failed", message: "I can only read PDF, Word (.docx), and text (.txt) files." },
-        ...current,
-      ]);
+      setUpload({ name, status: "failed", message: "I can only read PDF, Word (.docx), and text (.txt) files." });
       return;
     }
 
-    setFiles((current) => [{ name, status: "uploading" }, ...current.filter((item) => item.name !== name)]);
-    const update = (patch: Partial<UploadedFile>) =>
-      setFiles((current) => current.map((item) => (item.name === name ? { ...item, ...patch } : item)));
-
+    setUpload({ name, status: "uploading" });
     try {
       const result = await uploadDocument(file);
-      update({ status: "ready", sections: result.chunks });
+      setUpload(null);
+      await refreshDocuments();
+      // Focus answers on the document that was just added.
+      setSelected([result.document_id]);
+      setNotice(
+        result.status === "duplicate"
+          ? `You've already added this file, so I'm using the existing copy of “${result.filename}”. Answers will come from it only.`
+          : `“${result.filename}” is ready. Answers will now come from this document only. Tick other documents to include them too.`,
+      );
     } catch (requestError) {
-      update({
+      setUpload({
+        name,
         status: "failed",
         message: requestError instanceof Error ? requestError.message : "Upload failed. Please try again.",
       });
     }
+  }
+
+  async function removeDocument(doc: DocumentInfo) {
+    if (!window.confirm(`Remove “${doc.filename}”? It will no longer be used for answers.`)) return;
+    try {
+      await deleteDocument(doc.document_id);
+      setSelected((current) => current.filter((id) => id !== doc.document_id));
+      await refreshDocuments();
+    } catch (requestError) {
+      setDocumentsError(requestError instanceof Error ? requestError.message : "Couldn't remove that document.");
+    }
+  }
+
+  function toggleDocument(id: string) {
+    setNotice("");
+    setSelected((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
   }
 
   return (
@@ -123,32 +235,37 @@ function App() {
             </div>
           </div>
           {turns.length > 0 && (
-            <button className="button-secondary" disabled={busy} onClick={() => setTurns([])}>
-              Start over
+            <button className="button-secondary" disabled={busy} onClick={startNewChat}>
+              + New chat
             </button>
           )}
         </div>
       </header>
 
-      <div className="mx-auto grid w-full max-w-6xl flex-1 gap-6 px-5 py-6 lg:grid-cols-[280px_minmax(0,1fr)] lg:px-8">
-        <aside className="space-y-5 lg:sticky lg:top-24 lg:self-start">
-          <DocumentPanel files={files} onFile={addFile} />
-          <div className="card p-5">
-            <p className="text-sm font-semibold">How it works</p>
-            <ol className="mt-3 space-y-3 text-sm text-slate-600">
-              <Step number={1}>Add a document (PDF, Word, or text).</Step>
-              <Step number={2}>Ask a question in your own words.</Step>
-              <Step number={3}>I answer using only your documents and show where each fact came from.</Step>
-            </ol>
-          </div>
+      <div className="mx-auto grid w-full max-w-6xl flex-1 gap-6 px-5 py-6 lg:grid-cols-[300px_minmax(0,1fr)] lg:px-8">
+        <aside className="space-y-5 lg:sticky lg:top-24 lg:max-h-[calc(100vh-7rem)] lg:self-start lg:overflow-y-auto">
+          <DocumentPanel
+            documents={documents}
+            error={documentsError}
+            uploads={uploads}
+            selected={selected}
+            notice={notice}
+            onFile={addFile}
+            onToggle={toggleDocument}
+            onUseAll={() => { setNotice(""); setSelected([]); }}
+            onRemove={removeDocument}
+          />
+          <HistoryPanel chats={chats} activeId={chatId} busy={busy} onOpen={openChat} onRemove={removeChat} onNew={startNewChat} />
         </aside>
 
         <section className="flex min-h-[60vh] flex-col">
           <div className="flex-1 space-y-6 pb-6">
             {turns.length === 0 ? (
-              <Welcome hasFiles={files.some((file) => file.status === "ready")} onPick={(prompt) => { setQuery(prompt); inputRef.current?.focus(); }} />
+              <Welcome hasDocuments={readyDocuments.length > 0} onPick={(prompt) => { setQuery(prompt); inputRef.current?.focus(); }} />
             ) : (
-              turns.map((turn) => <TurnView key={turn.id} turn={turn} onRetry={() => submit(turn.question)} />)
+              turns.map((turn) => (
+                <TurnView key={turn.id} turn={turn} scopeLabel={scopeLabel(turn.scope ?? [], nameOf)} onRetry={() => submit(turn.question)} />
+              ))
             )}
             <div ref={bottomRef} />
           </div>
@@ -164,6 +281,7 @@ function App() {
             topK={topK}
             setTopK={setTopK}
             busy={busy}
+            scopeLabel={scopeLabel(selected, nameOf)}
             onSubmit={() => submit()}
           />
         </section>
@@ -172,22 +290,50 @@ function App() {
   );
 }
 
-function DocumentPanel({ files, onFile }: { files: UploadedFile[]; onFile: (file?: File) => void }) {
+function scopeLabel(ids: string[], nameOf: (id: string) => string) {
+  if (ids.length === 0) return "all documents";
+  if (ids.length === 1) return nameOf(ids[0]);
+  return `${ids.length} selected documents`;
+}
+
+function formatDate(value: string | null) {
+  if (!value) return "";
+  return new Date(value).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+}
+
+type DocumentPanelProps = {
+  documents: DocumentInfo[] | null;
+  error: string;
+  uploads: Upload[];
+  selected: string[];
+  notice: string;
+  onFile: (file?: File) => void;
+  onToggle: (id: string) => void;
+  onUseAll: () => void;
+  onRemove: (doc: DocumentInfo) => void;
+};
+
+function DocumentPanel({ documents, error, uploads, selected, notice, onFile, onToggle, onUseAll, onRemove }: DocumentPanelProps) {
   const [dragging, setDragging] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   return (
     <div className="card p-5">
-      <p className="text-sm font-semibold">Your documents</p>
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-semibold">Your documents</p>
+        {documents && documents.length > 0 && (
+          <span className="text-xs text-slate-400">{documents.length} total</span>
+        )}
+      </div>
       <button
         type="button"
-        className={`mt-3 flex w-full flex-col items-center rounded-2xl border-2 border-dashed px-4 py-6 text-center transition ${dragging ? "border-teal bg-teal/5" : "border-slate-200 hover:border-teal hover:bg-teal/5"}`}
+        className={`mt-3 flex w-full flex-col items-center rounded-2xl border-2 border-dashed px-4 py-5 text-center transition ${dragging ? "border-teal bg-teal/5" : "border-slate-200 hover:border-teal hover:bg-teal/5"}`}
         onClick={() => fileInput.current?.click()}
         onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
         onDragLeave={() => setDragging(false)}
         onDrop={(event) => { event.preventDefault(); setDragging(false); Array.from(event.dataTransfer.files).forEach(onFile); }}
       >
-        <span className="grid h-10 w-10 place-items-center rounded-full bg-teal/10 text-xl text-teal">+</span>
+        <span className="grid h-9 w-9 place-items-center rounded-full bg-teal/10 text-xl text-teal">+</span>
         <span className="mt-2 text-sm font-medium text-slate-700">Drop a file here or click to browse</span>
         <span className="mt-1 text-xs text-slate-400">PDF, Word, or text files</span>
       </button>
@@ -200,36 +346,122 @@ function DocumentPanel({ files, onFile }: { files: UploadedFile[]; onFile: (file
         onChange={(event) => { Array.from(event.target.files ?? []).forEach(onFile); event.target.value = ""; }}
       />
 
-      {files.length > 0 && (
-        <ul className="mt-4 space-y-2">
-          {files.map((file) => (
-            <li key={file.name} className="rounded-xl bg-mist px-3 py-2.5">
-              <p className="truncate text-sm font-medium text-slate-700" title={file.name}>{file.name}</p>
-              <p className={`mt-0.5 text-xs ${file.status === "failed" ? "text-red-600" : file.status === "ready" ? "text-teal" : "text-slate-500"}`}>
-                {file.status === "uploading" && "Reading this file…"}
-                {file.status === "ready" && `✓ Ready, ask away! (${file.sections} sections)`}
-                {file.status === "failed" && file.message}
-              </p>
-            </li>
-          ))}
-        </ul>
-      )}
-      {files.length === 0 && (
-        <p className="mt-3 text-xs leading-5 text-slate-500">Documents you've added before are still available, so you can start asking right away.</p>
+      {uploads.map((upload) => (
+        <div key={upload.name} className={`mt-3 rounded-xl px-3 py-2.5 text-xs ${upload.status === "failed" ? "bg-red-50 text-red-700" : "bg-mist text-slate-500"}`}>
+          <p className="truncate font-medium" title={upload.name}>{upload.name}</p>
+          <p className="mt-0.5 leading-5">{upload.status === "uploading" ? "Reading this file… this can take a minute." : upload.message}</p>
+        </div>
+      ))}
+
+      {notice && <p className="mt-3 rounded-xl bg-teal/5 px-3 py-2.5 text-xs leading-5 text-teal-800">{notice}</p>}
+      {error && <p className="mt-3 rounded-xl bg-red-50 px-3 py-2.5 text-xs leading-5 text-red-700">{error}</p>}
+
+      {documents === null && !error && <p className="mt-4 text-xs text-slate-400">Loading your documents…</p>}
+      {documents?.length === 0 && <p className="mt-4 text-xs leading-5 text-slate-500">No documents yet. Add one above to get started.</p>}
+
+      {documents && documents.length > 0 && (
+        <>
+          <div className="mt-4 flex items-center justify-between text-xs">
+            <span className="text-slate-500">
+              Asking about: <strong className="font-semibold text-slate-700">{selected.length === 0 ? "all documents" : `${selected.length} selected`}</strong>
+            </span>
+            {selected.length > 0 && <button className="font-medium text-teal hover:underline" onClick={onUseAll}>Use all</button>}
+          </div>
+          <ul className="mt-2 max-h-72 space-y-1.5 overflow-y-auto pr-1">
+            {documents.map((doc) => {
+              const readable = doc.chunks > 0;
+              const checked = selected.includes(doc.document_id);
+              return (
+                <li key={doc.document_id} className={`group flex items-start gap-2.5 rounded-xl px-2.5 py-2 transition ${checked ? "bg-teal/10" : "hover:bg-mist"}`}>
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-teal"
+                    checked={checked}
+                    disabled={!readable}
+                    onChange={() => onToggle(doc.document_id)}
+                    aria-label={`Ask about ${doc.filename}`}
+                  />
+                  <button className="min-w-0 flex-1 text-left" disabled={!readable} onClick={() => onToggle(doc.document_id)}>
+                    <p className="truncate text-sm font-medium text-slate-700" title={doc.filename}>{doc.filename}</p>
+                    <p className={`text-xs ${readable ? "text-slate-400" : "text-amber-600"}`}>
+                      {readable ? `Added ${formatDate(doc.created_at)}` : "No readable text. You can remove it."}
+                    </p>
+                  </button>
+                  <button
+                    className="shrink-0 rounded-md px-1.5 py-0.5 text-xs text-slate-400 opacity-60 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                    title="Remove document"
+                    onClick={() => onRemove(doc)}
+                  >
+                    ✕
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="mt-2 text-xs leading-5 text-slate-400">Tick documents to focus your questions on them. Leave all unticked to search everything.</p>
+        </>
       )}
     </div>
   );
 }
 
-function Welcome({ hasFiles, onPick }: { hasFiles: boolean; onPick: (prompt: string) => void }) {
+type HistoryPanelProps = {
+  chats: Chat[];
+  activeId: string;
+  busy: boolean;
+  onOpen: (chat: Chat) => void;
+  onRemove: (id: string) => void;
+  onNew: () => void;
+};
+
+function HistoryPanel({ chats, activeId, busy, onOpen, onRemove, onNew }: HistoryPanelProps) {
+  return (
+    <div className="card p-5">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-semibold">Recent chats</p>
+        <button className="text-xs font-medium text-teal hover:underline disabled:opacity-50" disabled={busy} onClick={onNew}>+ New chat</button>
+      </div>
+      {chats.length === 0 ? (
+        <p className="mt-3 text-xs leading-5 text-slate-500">Your conversations will appear here so you can come back to them later.</p>
+      ) : (
+        <ul className="mt-3 max-h-64 space-y-1 overflow-y-auto pr-1">
+          {chats.map((chat) => (
+            <li key={chat.id} className={`group flex items-center gap-2 rounded-xl px-2.5 py-2 transition ${chat.id === activeId ? "bg-teal/10" : "hover:bg-mist"}`}>
+              <button className="min-w-0 flex-1 text-left disabled:cursor-not-allowed" disabled={busy} onClick={() => onOpen(chat)}>
+                <p className="truncate text-sm text-slate-700" title={chat.title}>{chat.title}</p>
+                <p className="text-xs text-slate-400">
+                  {chat.turns.length} {chat.turns.length === 1 ? "question" : "questions"} · {new Date(chat.updatedAt).toLocaleDateString(undefined, { day: "numeric", month: "short" })}
+                </p>
+              </button>
+              <button
+                className="shrink-0 rounded-md px-1.5 py-0.5 text-xs text-slate-400 opacity-60 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                title="Delete chat"
+                onClick={() => onRemove(chat.id)}
+              >
+                ✕
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="mt-3 text-xs leading-5 text-slate-400">Saved in this browser only.</p>
+    </div>
+  );
+}
+
+function Welcome({ hasDocuments, onPick }: { hasDocuments: boolean; onPick: (prompt: string) => void }) {
   return (
     <div className="card p-6 sm:p-8">
       <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">Hi there 👋 What would you like to know?</h1>
       <p className="mt-3 max-w-2xl text-[15px] leading-7 text-slate-600">
-        {hasFiles ? "Your document is ready. " : ""}
         Ask me anything about your documents. I'll only answer from what's actually written in them, and I'll
         show you exactly where I found it. If the answer isn't there, I'll tell you instead of guessing.
       </p>
+      <ol className="mt-5 grid gap-3 text-sm text-slate-600 sm:grid-cols-3">
+        <Step number={1}>{hasDocuments ? "Pick documents on the left, or add a new one." : "Add a document on the left."}</Step>
+        <Step number={2}>Ask a question in your own words.</Step>
+        <Step number={3}>Click the numbers in my answer to see the source.</Step>
+      </ol>
       <p className="mt-6 text-sm font-medium text-slate-500">Not sure where to start? Try one of these:</p>
       <div className="mt-3 grid gap-3 sm:grid-cols-3">
         {suggestions.map((item) => (
@@ -243,13 +475,14 @@ function Welcome({ hasFiles, onPick }: { hasFiles: boolean; onPick: (prompt: str
   );
 }
 
-function TurnView({ turn, onRetry }: { turn: Turn; onRetry: () => void }) {
+function TurnView({ turn, scopeLabel, onRetry }: { turn: Turn; scopeLabel: string; onRetry: () => void }) {
   return (
     <div className="space-y-3">
-      <div className="flex justify-end">
+      <div className="flex flex-col items-end gap-1">
         <div className="max-w-[85%] rounded-2xl rounded-br-md bg-ink px-4 py-3 text-[15px] leading-6 text-white">
           {turn.question}
         </div>
+        <span className="max-w-[85%] truncate text-xs text-slate-400" title={scopeLabel}>📄 Searched {scopeLabel}</span>
       </div>
       <div className="card p-5 sm:p-6">
         {turn.status === "loading" && <Thinking kind={turn.kind} />}
@@ -366,6 +599,7 @@ function TrustNote({ validation, hasSources }: { validation: AskResponse["citati
 function FormattedAnswer({ text, onCite }: { text: string; onCite: (label: string) => void }) {
   const blocks: ReactNode[] = [];
   let bullets: string[] = [];
+  let tableRows: string[][] = [];
 
   const flushBullets = () => {
     if (bullets.length === 0) return;
@@ -377,8 +611,39 @@ function FormattedAnswer({ text, onCite }: { text: string; onCite: (label: strin
     bullets = [];
   };
 
+  const flushTable = () => {
+    if (tableRows.length === 0) return;
+    const [header, ...body] = tableRows;
+    blocks.push(
+      <div key={`table-${blocks.length}`} className="overflow-x-auto rounded-xl border border-slate-200">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-mist text-slate-700">
+            <tr>{header.map((cell, index) => <th key={index} className="px-3 py-2 font-semibold"><Inline text={cell} onCite={onCite} /></th>)}</tr>
+          </thead>
+          <tbody>
+            {body.map((row, rowIndex) => (
+              <tr key={rowIndex} className="border-t border-slate-100">
+                {row.map((cell, index) => <td key={index} className="px-3 py-2 align-top"><Inline text={cell} onCite={onCite} /></td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>,
+    );
+    tableRows = [];
+  };
+
   for (const rawLine of text.split("\n")) {
     const line = rawLine.trim();
+    if (line.startsWith("|") && line.endsWith("|")) {
+      flushBullets();
+      // Skip the |---|---| separator row.
+      if (!/^\|[\s:|-]+\|$/.test(line)) {
+        tableRows.push(line.slice(1, -1).split("|").map((cell) => cell.trim()));
+      }
+      continue;
+    }
+    flushTable();
     const bullet = line.match(/^(?:[-*•]|\d+\.)\s+(.*)$/);
     if (bullet) {
       bullets.push(bullet[1]);
@@ -394,6 +659,7 @@ function FormattedAnswer({ text, onCite }: { text: string; onCite: (label: strin
     );
   }
   flushBullets();
+  flushTable();
 
   return <>{blocks}</>;
 }
@@ -479,18 +745,24 @@ type ComposerProps = {
   topK: number;
   setTopK: (value: number) => void;
   busy: boolean;
+  scopeLabel: string;
   onSubmit: () => void;
 };
 
-function Composer({ inputRef, query, setQuery, kind, setKind, mode, setMode, topK, setTopK, busy, onSubmit }: ComposerProps) {
+function Composer({ inputRef, query, setQuery, kind, setKind, mode, setMode, topK, setTopK, busy, scopeLabel, onSubmit }: ComposerProps) {
   const tooShort = query.trim().length < 3;
 
   return (
     <div className="sticky bottom-0 -mx-1 bg-gradient-to-t from-mist via-mist to-mist/0 px-1 pb-4 pt-4">
       <div className="card p-2">
-        <div className="flex gap-1 px-2 pt-1">
-          <ModeTab active={kind === "ask"} onClick={() => setKind("ask")}>💬 Get an answer</ModeTab>
-          <ModeTab active={kind === "find"} onClick={() => setKind("find")}>🔍 Just find passages</ModeTab>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-2 pt-1">
+          <div className="flex gap-1">
+            <ModeTab active={kind === "ask"} onClick={() => setKind("ask")}>💬 Get an answer</ModeTab>
+            <ModeTab active={kind === "find"} onClick={() => setKind("find")}>🔍 Just find passages</ModeTab>
+          </div>
+          <span className="max-w-full truncate text-xs text-slate-400 sm:max-w-[50%]" title={scopeLabel}>
+            Asking about: <span className="font-medium text-slate-600">{scopeLabel}</span>
+          </span>
         </div>
         <textarea
           ref={inputRef}

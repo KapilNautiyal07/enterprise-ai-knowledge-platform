@@ -33,11 +33,15 @@ export interface SearchResponse {
   results: Source[];
 }
 
-export interface UploadResponse {
+export interface DocumentInfo {
   document_id: string;
   filename: string;
   file_type: string;
-  characters: number;
   chunks: number;
-  status: string;
+  created_at: string | null;
+}
+
+export interface UploadResponse extends DocumentInfo {
+  characters: number;
+  status: "processed" | "duplicate";
 }

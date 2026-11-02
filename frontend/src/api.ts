@@ -1,5 +1,6 @@
 import type {
   AskResponse,
+  DocumentInfo,
   SearchMode,
   SearchResponse,
   UploadResponse,
@@ -54,11 +55,28 @@ export function uploadDocument(file: File): Promise<UploadResponse> {
   });
 }
 
-export function askQuestion(query: string, topK: number): Promise<AskResponse> {
+export async function listDocuments(): Promise<DocumentInfo[]> {
+  const response = await request<{ documents: DocumentInfo[] }>("/documents/");
+  return response.documents;
+}
+
+export function deleteDocument(documentId: string): Promise<unknown> {
+  return request(`/documents/${documentId}`, { method: "DELETE" });
+}
+
+export function askQuestion(
+  query: string,
+  topK: number,
+  documentIds: string[],
+): Promise<AskResponse> {
   return request<AskResponse>("/ask/", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k: topK }),
+    body: JSON.stringify({
+      query,
+      top_k: topK,
+      document_ids: documentIds.length > 0 ? documentIds : null,
+    }),
   });
 }
 
@@ -66,6 +84,7 @@ export function searchDocuments(
   query: string,
   topK: number,
   mode: SearchMode,
+  documentIds: string[],
 ): Promise<SearchResponse> {
   const endpoint =
     mode === "semantic"
@@ -75,7 +94,7 @@ export function searchDocuments(
         : mode === "hybrid"
           ? "/search/hybrid"
           : "/search/reranked";
-  return request<SearchResponse>(
-    `${endpoint}?query=${encodeURIComponent(query)}&top_k=${topK}`,
-  );
+  const params = new URLSearchParams({ query, top_k: String(topK) });
+  documentIds.forEach((id) => params.append("document_ids", id));
+  return request<SearchResponse>(`${endpoint}?${params}`);
 }

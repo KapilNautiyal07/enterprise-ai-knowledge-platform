@@ -316,6 +316,16 @@ Response example:
 }
 ```
 
+If the same content was uploaded before, the existing document is returned with `"status": "duplicate"` and nothing new is stored. Files without extractable text (for example scanned images) are rejected with HTTP 422.
+
+#### GET `/documents/`
+
+Lists uploaded documents (newest first) with their section counts and upload dates.
+
+#### DELETE `/documents/{document_id}`
+
+Removes a document and all of its indexed sections.
+
 ### Search endpoints
 
 #### GET `/search/?query=...&top_k=5`
@@ -343,9 +353,12 @@ Request body:
 ```json
 {
   "query": "What does the policy say about remote work?",
-  "top_k": 5
+  "top_k": 5,
+  "document_ids": ["..."]
 }
 ```
+
+`document_ids` is optional and limits the answer to those documents. When the selected documents are small (up to 15 sections), they are read in full instead of retrieving the top passages, which gives complete summaries. The search endpoints accept the same filter as repeated `document_ids` query parameters.
 
 Response example:
 

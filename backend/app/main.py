@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,12 +7,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.documents import router as document_router
 from app.api.search import router as search_router
 from app.api.ask import router as ask_router
+from app.core.init_db import initialize_database
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Creates missing tables/columns; safe to run on every start.
+    initialize_database()
+    yield
 
 
 app = FastAPI(
     title="Enterprise AI Knowledge Platform",
     description="AI Enterprise Knowledge & Decision Intelligence Platform",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 # Comma-separated list of extra frontend URLs, e.g. the deployed site.

@@ -32,6 +32,13 @@ class Document(Base):
         nullable=False
     )
 
+    # SHA-256 of the extracted chunks, used to detect re-uploads of the same file.
+    content_hash = Column(
+        String(64),
+        index=True,
+        nullable=True
+    )
+
     created_at = Column(
         DateTime,
         default=datetime.utcnow
