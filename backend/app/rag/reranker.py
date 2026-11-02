@@ -1,9 +1,16 @@
-from sentence_transformers import CrossEncoder
+import os
+
+from fastembed.rerank.cross_encoder import TextCrossEncoder
 
 
-MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# ONNX build of cross-encoder/ms-marco-MiniLM-L-6-v2 (identical scores).
+MODEL_NAME = "Xenova/ms-marco-MiniLM-L-6-v2"
 
-reranker = CrossEncoder(MODEL_NAME)
+reranker = TextCrossEncoder(
+    MODEL_NAME,
+    cache_dir=os.getenv("MODEL_CACHE_DIR", "model_cache"),
+    threads=1
+)
 
 
 def rerank_chunks(
@@ -18,15 +25,17 @@ def rerank_chunks(
     if not results:
         return []
 
-    pairs = [
-        (
-            query,
-            item["chunk"].content
-        )
+    passages = [
+        item["chunk"].content
         for item in results
     ]
 
-    scores = reranker.predict(pairs)
+    # Small batches keep peak memory low on 512 MB hosts.
+    scores = reranker.rerank(
+        query,
+        passages,
+        batch_size=4
+    )
 
     for item, score in zip(results, scores):
         item["reranker_score"] = float(score)

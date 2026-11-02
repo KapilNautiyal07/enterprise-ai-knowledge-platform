@@ -267,18 +267,26 @@ function TurnView({ turn, onRetry }: { turn: Turn; onRetry: () => void }) {
 }
 
 function Thinking({ kind }: { kind: Turn["kind"] }) {
-  const [step, setStep] = useState(0);
+  const [seconds, setSeconds] = useState(0);
   useEffect(() => {
-    const timer = setInterval(() => setStep((current) => Math.min(current + 1, thinkingSteps.length - 1)), 1800);
+    const timer = setInterval(() => setSeconds((current) => current + 1), 1000);
     return () => clearInterval(timer);
   }, []);
+  const step = Math.min(Math.floor(seconds / 2), thinkingSteps.length - 1);
 
   return (
-    <div className="flex items-center gap-3 text-sm text-slate-500">
-      <span className="flex gap-1">
-        {[0, 1, 2].map((dot) => <span key={dot} className="h-2 w-2 animate-bounce rounded-full bg-teal" style={{ animationDelay: `${dot * 150}ms` }} />)}
-      </span>
-      {kind === "ask" ? thinkingSteps[step] : "Searching your documents…"}
+    <div>
+      <div className="flex items-center gap-3 text-sm text-slate-500">
+        <span className="flex gap-1">
+          {[0, 1, 2].map((dot) => <span key={dot} className="h-2 w-2 animate-bounce rounded-full bg-teal" style={{ animationDelay: `${dot * 150}ms` }} />)}
+        </span>
+        {kind === "ask" ? thinkingSteps[step] : "Searching your documents…"}
+      </div>
+      {seconds >= 12 && (
+        <p className="mt-3 text-xs leading-5 text-slate-400">
+          Taking a little longer than usual. If I haven't been used for a while, the server needs up to a minute to wake up. Thanks for your patience!
+        </p>
+      )}
     </div>
   );
 }

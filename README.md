@@ -90,7 +90,7 @@ enterprise-ai-knowledge-platform/
 │   │   │   ├── chunker.py        # text chunking
 │   │   │   ├── context_builder.py# evidence packaging
 │   │   │   ├── citation_validator.py
-│   │   │   ├── embeddings.py     # sentence-transformer embeddings
+│   │   │   ├── embeddings.py     # all-MiniLM-L6-v2 embeddings (ONNX)
 │   │   │   ├── generation.py     # Groq answer generation
 │   │   │   ├── reranker.py       # cross-encoder reranking
 │   │   │   └── retrieval.py      # vector + keyword + hybrid search
@@ -216,7 +216,7 @@ This reduces the risk of relying on only one retrieval mode.
 
 #### 4.4 Cross-encoder reranking
 
-`rerank_chunks()` uses a cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v2`) to evaluate the query against each candidate chunk in context.
+`rerank_chunks()` uses a cross-encoder model (`ms-marco-MiniLM-L-6-v2`, ONNX build via `fastembed`) to evaluate the query against each candidate chunk in context.
 
 This step reorders the hybrid candidate set and helps prioritize the most relevant pieces before they are passed into the LLM.
 
@@ -248,7 +248,8 @@ The generation layer is configured in `backend/app/rag/embeddings.py` and `backe
 
 ### Embeddings
 
-- `SentenceTransformer("all-MiniLM-L6-v2")`
+- `all-MiniLM-L6-v2` (384 dimensions), run through `fastembed` with ONNX Runtime
+- Produces the same vectors as the `sentence-transformers` model without requiring PyTorch, which keeps memory under ~450 MB
 - Used both for indexing stored text chunks and for embedding user queries
 - Embeddings are normalized before storage and retrieval
 
@@ -438,6 +439,8 @@ GROQ_API_KEY=...
 GROQ_MODEL=openai/gpt-oss-120b
 ```
 
+Optional: `FRONTEND_ORIGINS` adds comma-separated frontend URLs to the CORS allow-list (needed when the frontend is deployed).
+
 The application expects PostgreSQL with the pgvector extension enabled. The database bootstrap script creates the extension automatically when initialized.
 
 ---
@@ -493,13 +496,43 @@ The FastAPI app includes CORS support for the local Vite origins:
 - `http://localhost:5173`
 - `http://127.0.0.1:5173`
 
+plus any URLs listed in `FRONTEND_ORIGINS`.
+
 The frontend provides:
 
 - PDF, DOCX, and TXT upload and indexing
 - cited question answering through `/ask/`
 - semantic, keyword, hybrid, and reranked search
-- source cards with chunk and retrieval score metadata
-- citation coverage and retrieval statistics
+- clickable citations that jump to the supporting passage
+- plain-language trust notes based on citation validation
+
+---
+
+## Deployment (free tier)
+
+| Part | Service | Notes |
+|------|---------|-------|
+| Database | [Neon](https://neon.tech) | Serverless PostgreSQL with pgvector |
+| Backend | [Render](https://render.com) free web service | Configured by `render.yaml` (512 MB RAM) |
+| Frontend | [Vercel](https://vercel.com) | Static Vite build |
+
+### Backend on Render
+
+1. In Render, choose **New > Blueprint** and select this repository. Render reads `render.yaml`.
+2. Fill in the secret environment variables when prompted:
+   - `DATABASE_URL`: the Neon connection string
+   - `GROQ_API_KEY`: the Groq API key
+   - `FRONTEND_ORIGINS`: the Vercel URL (can be added after the frontend is deployed)
+3. Deploy, then check `https://<service>.onrender.com/health`.
+
+The free instance sleeps after 15 minutes without traffic, so the first request after a pause can take about a minute.
+Uploaded files are stored on ephemeral disk; their extracted text and embeddings are kept in the database, so search and answers keep working after restarts.
+
+### Frontend on Vercel
+
+1. Import the repository in Vercel and set **Root Directory** to `frontend` (Vite is detected automatically).
+2. Add the environment variable `VITE_API_URL=https://<service>.onrender.com`.
+3. Deploy, then add the Vercel URL to `FRONTEND_ORIGINS` on Render.
 
 ---
 
